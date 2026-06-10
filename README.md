@@ -193,7 +193,7 @@ python3 run_mapping.py \
 
 The system first synchronizes the trajectory and image timestamps, then creates a temporary ROS2 MCAP bag with `rosbags`. The temporary bag is written under a `tmp/synced_bags` directory next to the output session folder and is deleted automatically when processing finishes.
 
-If you encounter a CUDA out-of-memory error, please refer to #2.
+**If you encounter a CUDA out-of-memory error, please refer to [Issue #2](https://github.com/ori-drs/ScaRF-SLAM/issues/2).**
 
 ⚠️ If the images are already rectified pinhole images, update the pinhole intrinsics and resolution in the config file and remove any `fisheye_cam*` sections:
 
