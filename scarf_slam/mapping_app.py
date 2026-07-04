@@ -1736,6 +1736,9 @@ class ScaRFSLAM():
             else 1e-3
         )
         self.max_distance = self.config.get("max_distance") if not self.is_mono else 0
+        self.conf_thresh_percentile = float(self.config.get("conf_thresh_percentile", 25.0))
+        if not 0.0 <= self.conf_thresh_percentile <= 100.0:
+            raise ValueError("conf_thresh_percentile must be between 0 and 100.")
         self.num_ref_poses_per_batch = self.config.get("num_ref_poses_per_batch")
         self.num_ref_poses_per_submap = self.config.get(
             "num_ref_poses_per_submap",
@@ -1947,7 +1950,10 @@ class ScaRFSLAM():
             inference_duration = self._add_elapsed_time("model_inference_time", inference_start_time)
 
             self._update_max_distance_for_batch(ref_ts_sub)
-            predictions = self._filter_prediction_confidence(predictions, conf_thresh_percentile=25)
+            predictions = self._filter_prediction_confidence(
+                predictions,
+                conf_thresh_percentile=self.conf_thresh_percentile,
+            )
 
             if (
                 not self.is_mono
