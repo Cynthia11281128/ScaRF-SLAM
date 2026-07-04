@@ -58,7 +58,6 @@ from scarf_slam.mapping import graph_io
 from scarf_slam.utils.timestamp_ops import (
     pose_dicts_equal,
     timestamp_key_to_nsec,
-    timestamp_key_to_seconds,
     timestamp_key_to_timestamp,
     timestamp_nsec_to_key,
 )
@@ -137,12 +136,21 @@ def _require_cuda():
 
 
 class ScaRFSLAM():
-    def __init__(self, slam_folder, input_bag=None, prev_slam_folder=None, image_folder=None, poses=None):
+    def __init__(
+        self,
+        slam_folder,
+        input_bag=None,
+        prev_slam_folder=None,
+        image_folder=None,
+        poses=None,
+        da3_model_path=None,
+    ):
         self.slam_folder = slam_folder
         self.input_bag = input_bag
         self.prev_slam_folder = prev_slam_folder
         self.image_folder = image_folder
         self.poses = poses
+        self.da3_model_path = da3_model_path
 
         self.transforms = MappingTransforms()
         self.submaps: Dict[str, SubmapRecord] = {}
@@ -1502,6 +1510,20 @@ class ScaRFSLAM():
         return False
 
 
+    def _export_optimized_keyframe_depths(
+        self,
+        *,
+        est_poses_sub,
+        images: np.ndarray,
+        depths: np.ndarray,
+        confidences: np.ndarray,
+        intrinsics: np.ndarray,
+        extrinsics: np.ndarray,
+    ) -> None:
+        """Optional hook for wrappers that export ScaRF-optimized frame depth."""
+        return None
+
+
     def app_configure(self, config_path: Union[str, Path]):
         # Config the application
         config_path = Path(config_path).expanduser()
@@ -1704,11 +1726,15 @@ class ScaRFSLAM():
 
         self.vis_matcher = self.config.get("vis_matcher", "superpoint-lightglue")
 
-        self.select_kf_on_time = self.config.get("select_kf_on_time")
-        self.sec_skip = self.config.get("sec_skip")
+        self.select_kf_on_time = bool(self.config.get("select_kf_on_time", False))
+        self.sec_skip = float(self.config.get("sec_skip", 0.0) or 0.0)
 
-        self.kf_distance = self.config.get("kf_distance") if not self.is_mono else 1e-3
-        self.kf_angle_rad = np.deg2rad(self.config.get("kf_angle_deg")) if not self.is_mono else 1e-3
+        self.kf_distance = float(self.config.get("kf_distance", 0.0) or 0.0) if not self.is_mono else 1e-3
+        self.kf_angle_rad = (
+            np.deg2rad(float(self.config.get("kf_angle_deg", 0.0) or 0.0))
+            if not self.is_mono
+            else 1e-3
+        )
         self.max_distance = self.config.get("max_distance") if not self.is_mono else 0
         self.num_ref_poses_per_batch = self.config.get("num_ref_poses_per_batch")
         self.num_ref_poses_per_submap = self.config.get(
@@ -1780,9 +1806,34 @@ class ScaRFSLAM():
         # --- load model ---
         if self.model_name == "da":
             from depth_anything_3.api import DepthAnything3
-            self.model = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE").to(device=self.device)
+            model_ref = (
+                self.da3_model_path
+                or self.config.get("da3_model_path")
+                or self.config.get("weights")
+                or self.config.get("model_dir")
+                or "depth-anything/DA3NESTED-GIANT-LARGE"
+            )
+            model_ref = os.path.expandvars(str(model_ref))
+            model_path = Path(model_ref).expanduser()
+            if model_ref.startswith("~") or model_path.exists():
+                model_ref = str(model_path)
+            print(f"\n=== Loading DA3 Model: {model_ref} ===")
+            self.model = DepthAnything3.from_pretrained(model_ref).to(device=self.device)
         else:
             raise ValueError(f"Invalid self.model_name: {self.model_name}")
+
+
+    def _select_ref_pose_indices_for_batch(self, overlap_indices: Sequence[int]) -> List[int]:
+        return keyframe_selection.select_keyframe_indices_for_batch(
+            timestamps=self.ref_timestamps,
+            pose_dict=self.odom_ref_poses_dict,
+            overlap_indices=overlap_indices,
+            batch_size=self.num_ref_poses_per_batch,
+            select_kf_on_time=self.select_kf_on_time,
+            sec_skip=self.sec_skip,
+            kf_distance=self.kf_distance,
+            kf_angle_rad=self.kf_angle_rad,
+        )
 
 
     def do_processing_outer(self):
@@ -1803,36 +1854,7 @@ class ScaRFSLAM():
                 next_periodic_submap_opt_count += periodic_submap_opt_interval
 
         while True:
-            indices = indices_overlap
-
-            i = indices_overlap[-1] + 1
-            while i < len(self.ref_timestamps) and len(indices) < self.num_ref_poses_per_batch:
-                if self.select_kf_on_time:
-                    last_ts = self.ref_timestamps[indices[-1]]
-                    curr_ts = self.ref_timestamps[i]
-                    if (
-                        (timestamp_key_to_seconds(curr_ts) - timestamp_key_to_seconds(last_ts)) >= self.sec_skip
-                        and keyframe_selection.motion_exceeds_threshold(
-                            self.odom_ref_poses_dict[last_ts],
-                            self.odom_ref_poses_dict[curr_ts],
-                            self.kf_distance,
-                            self.kf_angle_rad,
-                        )
-                    ):
-                        indices.append(i)
-                else:
-                    # Determine new mapping frame using the reference pose (pose of fisheye cam0)
-                    t_curr = self.ref_timestamps[i]
-
-                    t_prev = self.ref_timestamps[indices[-1]]
-                    if keyframe_selection.motion_exceeds_threshold(
-                        self.odom_ref_poses_dict[t_prev],
-                        self.odom_ref_poses_dict[t_curr],
-                        self.kf_distance,
-                        self.kf_angle_rad,
-                    ):
-                        indices.append(i)
-                i += 1
+            indices = self._select_ref_pose_indices_for_batch(indices_overlap)
 
             if not indices or len(indices) < self.num_ref_poses_per_batch:
                 print(f"No enough poses left; exiting loop.")
@@ -2053,6 +2075,14 @@ class ScaRFSLAM():
         depths_t = torch.as_tensor(depths, dtype=torch.float32, device=fusion_device)
         intrinsics_batch = intrinsics if intrinsics.ndim == 3 else np.stack([intrinsics] * N)
         intrinsics_batch = np.asarray(intrinsics_batch, dtype=np.float32)
+        self._export_optimized_keyframe_depths(
+            est_poses_sub=est_poses_sub,
+            images=imgs,
+            depths=depths,
+            confidences=confs,
+            intrinsics=intrinsics_batch,
+            extrinsics=extrinsics,
+        )
         intrinsics_t = torch.as_tensor(intrinsics_batch, dtype=torch.float32, device=fusion_device)
         extrinsics_t = torch.as_tensor(extrinsics, dtype=torch.float32, device=fusion_device)
         pts_world_batch_t = depth_to_world_points_vectorized(
@@ -2794,6 +2824,16 @@ def main(args=None):
         default=None,
         help="Optional path to the previous SLAM session folder.",
     )
+    parser.add_argument(
+        "--weights",
+        "--da3_model_path",
+        dest="da3_model_path",
+        default=None,
+        help=(
+            "Hugging Face model id or local DA3 weights directory. "
+            "Overrides da3_model_path/weights/model_dir in the config."
+        ),
+    )
     parsed_args = parser.parse_args(args)
     using_bag_input = parsed_args.input_bag is not None
     using_file_input = parsed_args.image_folder is not None or parsed_args.poses is not None
@@ -2812,6 +2852,8 @@ def main(args=None):
     print("  config:", parsed_args.config)
     if parsed_args.prev_slam_folder is not None:
         print("  prev_slam_folder:", parsed_args.prev_slam_folder)
+    if parsed_args.da3_model_path is not None:
+        print("  da3_model_path:", parsed_args.da3_model_path)
     print(" ")
 
     app = ScaRFSLAM(
@@ -2820,6 +2862,7 @@ def main(args=None):
         prev_slam_folder=parsed_args.prev_slam_folder,
         image_folder=parsed_args.image_folder,
         poses=parsed_args.poses,
+        da3_model_path=parsed_args.da3_model_path,
     )
     try:
         app.app_configure(parsed_args.config)

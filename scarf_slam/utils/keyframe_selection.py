@@ -1,9 +1,10 @@
 import math
-from typing import List, Sequence, Tuple
+from typing import Mapping, List, Sequence, Tuple
 
 import numpy as np
 
 from scarf_slam.core.pose import MappingPose
+from scarf_slam.utils.timestamp_ops import timestamp_key_to_seconds
 
 
 def normalized_vector(vec: Sequence[float]) -> np.ndarray:
@@ -45,6 +46,56 @@ def motion_exceeds_threshold(
     curr_view = view_vector_from_quat(current_pose.quat)
     angle_cond = angle_between_vectors(prev_view, curr_view) >= kf_angle_rad
     return dist_cond or angle_cond
+
+
+def select_keyframe_indices_for_batch(
+    timestamps: Sequence[str],
+    pose_dict: Mapping[str, MappingPose],
+    overlap_indices: Sequence[int],
+    batch_size: int,
+    select_kf_on_time: bool,
+    sec_skip: float,
+    kf_distance: float,
+    kf_angle_rad: float,
+) -> List[int]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if not overlap_indices:
+        raise ValueError("overlap_indices must contain at least one index.")
+    if len(timestamps) == 0:
+        return []
+
+    indices = list(overlap_indices)
+    for idx in indices:
+        if idx < 0 or idx >= len(timestamps):
+            raise IndexError(f"overlap index {idx} is outside timestamp range [0, {len(timestamps)}).")
+
+    i = indices[-1] + 1
+    while i < len(timestamps) and len(indices) < batch_size:
+        last_ts = timestamps[indices[-1]]
+        curr_ts = timestamps[i]
+        if last_ts not in pose_dict:
+            raise KeyError(f"Missing previous keyframe pose for timestamp {last_ts}")
+        if curr_ts not in pose_dict:
+            raise KeyError(f"Missing candidate keyframe pose for timestamp {curr_ts}")
+
+        motion_ok = motion_exceeds_threshold(
+            pose_dict[last_ts],
+            pose_dict[curr_ts],
+            kf_distance,
+            kf_angle_rad,
+        )
+        if select_kf_on_time:
+            time_ok = (timestamp_key_to_seconds(curr_ts) - timestamp_key_to_seconds(last_ts)) >= sec_skip
+            should_select = time_ok and motion_ok
+        else:
+            should_select = motion_ok
+
+        if should_select:
+            indices.append(i)
+        i += 1
+
+    return indices
 
 
 def validate_submap_window_config(
