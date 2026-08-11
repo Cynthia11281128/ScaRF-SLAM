@@ -1296,7 +1296,7 @@ class ScaRFSLAM():
             raise ValueError(f"Invalid prediction slice: start={view_start}, end={view_end}.")
 
         sliced_fields = {}
-        for attr_name in ("processed_images", "depth", "conf", "extrinsics", "intrinsics", "mask"):
+        for attr_name in ("processed_images", "depth", "conf", "raw_confidences", "extrinsics", "intrinsics", "mask"):
             if not hasattr(predictions, attr_name):
                 continue
             attr_value = getattr(predictions, attr_name)
@@ -1519,6 +1519,7 @@ class ScaRFSLAM():
         confidences: np.ndarray,
         intrinsics: np.ndarray,
         extrinsics: np.ndarray,
+        raw_confidences: Optional[np.ndarray] = None,
     ) -> None:
         """Optional hook for wrappers that export ScaRF-optimized frame depth."""
         return None
@@ -1950,6 +1951,7 @@ class ScaRFSLAM():
             inference_duration = self._add_elapsed_time("model_inference_time", inference_start_time)
 
             self._update_max_distance_for_batch(ref_ts_sub)
+            predictions.raw_confidences = predictions.conf.copy()
             predictions = self._filter_prediction_confidence(
                 predictions,
                 conf_thresh_percentile=self.conf_thresh_percentile,
@@ -2088,6 +2090,7 @@ class ScaRFSLAM():
             confidences=confs,
             intrinsics=intrinsics_batch,
             extrinsics=extrinsics,
+            raw_confidences=getattr(predictions, "raw_confidences", None),
         )
         intrinsics_t = torch.as_tensor(intrinsics_batch, dtype=torch.float32, device=fusion_device)
         extrinsics_t = torch.as_tensor(extrinsics, dtype=torch.float32, device=fusion_device)
